@@ -8,12 +8,42 @@ logging:
 spring:
   application:
     name: gateway-ecommerce
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: algashop
+      database: 3
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://auth.algashop.local:8081
   cloud:
     gateway:
       server:
         webflux:
+          route-refresh-listener:
+            enabled: false
+          #          filter:
+          #            local-response-cache:
+          #              enabled: true
+          #              time-to-live: 1m
+          #              size: 10MB
           default-filters:
             - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_FIRST
+            - name: Retry
+              args:
+                retries: 3
+                statuses: BAD_GATEWAY, INTERNAL_SERVER_ERROR
+                methods: GET,PUT
+                exceptions: java.io.IOException, java.util.concurrent.TimeoutException
+                backoff:
+                  firstBackoff: 10ms
+                  maxBackoff: 20ms
+          httpclient:
+            connect-timeout: 1000
+            response-timeout: 5000
           globalcors:
             cors-configurations:
               '[/**]':
@@ -29,33 +59,55 @@ spring:
             - id: billing-route
               uri: lb://billing
               predicates:
-                - Path=/api/v1/customers/me/orders/{orderId}/invoice
-                - Method=GET
+                - Path=/api/v1/customers/me/orders/{orderId}/invoice,/api/v1/orders/{orderId}/invoice,/api/v1/customers/me/credit-cards,/api/v1/customers/me/credit-cards/{creditCardId}
+                - Method=GET,POST,PUT,DELETE,OPTIONS
             - id: ordering-route
               uri: lb://ordering
               predicates:
-                - Path=/api/v1/orders/**,/api/v1/customers/**
+                - Path=/api/v1/orders/**,/api/v1/customers/**,/api/v1/shipping-cost-previews
+                - Method=GET,POST,PUT,DELETE,OPTIONS
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: ordering-route-cb
+                    statusCodes:
+                      - 502
+                      - 504
+                      - 500
             - id: product-catalog-route
               uri: lb://product-catalog
               predicates:
-                - Path=/api/v1/products/**,/api/v1/categories/**
+                - Path=/api/v1/products/**,/api/v1/categories/**,/api/v1/upload-requests/**
                 - Method=GET,POST,PUT,DELETE,OPTIONS
+              filters:
+                - LocalResponseCache=5m,30MB
+                - name: RequestRateLimiter
+                  args:
+                    redis-rate-limiter:
+                      replenishRate: 50
+                      burstCapacity: 200
+                      requestedTokens: 1
+                    key-resolver: "#{@rateLimitKeyResolver}"
             - id: product-catalog-test-route
               uri: lb://product-catalog
               predicates:
                 - Path=/products/**
               filters:
-                - RewritePath=/products/?(?<segment>.*), /api/v1/products$\{segment}
+                - RewritePath=/products/?(?<segment>.*), /api/v1/products${segment}
                 - AddResponseHeader=X-Path-rewrite-info, Path have been rewrite to /api/v1/products
+              metadata:
+                response-timeout: 1000
+                connect-timeout: 1000
             - id: user-management-route
               uri: lb://authorization-server
               predicates:
                 - Path=/api/v1/users/**
+                - Method=GET,POST,PUT,DELETE,OPTIONS
 
 eureka:
   client:
     serviceUrl:
-      defaultZone: http://localhost:8761/eureka
+      defaultZone: http://algashop-service-registry:8761/eureka
     registerWithEureka: false
     fetchRegistry: true
 
@@ -63,7 +115,20 @@ management:
   endpoints:
     web:
       exposure:
-        include: health, gateway
+        include: health, gateway, circuitbreakers
   endpoint:
     gateway:
       enabled: true
+
+
+resilience4j.circuitbreaker:
+  instances:
+    ordering-route-cb:
+      slidingWindowSize: 8
+      failureRateThreshold: 50
+      minimumNumberOfCalls: 5
+      permittedNumberOfCallsInHalfOpenState: 5
+      slidingWindowType: COUNT_BASED
+      waitDurationInOpenState: 10s
+      maxWaitDurationInHalfOpenState: 30s
+      registerHealthIndicator: true
